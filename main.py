@@ -13,7 +13,7 @@ DB_DSN = os.environ.get(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.pool = await asyncpg.create_pool(DB_DSN, min_size=10, max_size=50)
+    app.state.pool = await asyncpg.create_pool(DB_DSN, min_size=5, max_size=20)
     yield
     await app.state.pool.close()
 

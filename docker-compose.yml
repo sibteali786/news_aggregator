@@ -21,6 +21,10 @@ services:
       retries: 5
   api:
     build: .
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     container_name: feed_api
     restart: unless-stopped
     environment:
