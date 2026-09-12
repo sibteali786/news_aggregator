@@ -34,5 +34,17 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+  rss_poller:
+    build:
+      context: .
+      dockerfile: Dockerfile.poller
+    container_name: rss_poller
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://feed_admin:feed_pass@postgres:5432/feed_engine
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 volumes:
   pgdata:

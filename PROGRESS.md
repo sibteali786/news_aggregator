@@ -209,20 +209,99 @@ preference stored in the assistant's memory system, not just for today.
   relative to the cost (lost type safety/validation from bypassing `Query()`). The honest next
   lever is more compute (horizontal scaling across real additional hardware), not more tuning.
 
+### Phase 1 — closed out (2026-09-12)
+- Confirmed Gunicorn's `CMD` never included `--access-logfile` in the first place — the "free
+  experiment" from the previous session was already effectively done, just not logged as such.
+- **Decision: accept current p99 (~1.34–1.4s, down from a 10.93s baseline) as this hardware's
+  ceiling.** Not pursuing further code-level tuning — diminishing returns confirmed by reasoning
+  (dependency resolution, DB round-trip, serialization, and access logging are all now similarly
+  small costs, no single dominant one left).
+- **Horizontal scaling reasoning exercise (not yet run):** worked through whether capping a
+  container to `--cpus=2` and running two replicas behind a load balancer on this same 4-core host
+  would help. Correctly reasoned through to the answer without running it: total physical compute
+  is conserved (Docker's `--cpus` is a CFS quota, not dedicated silicon), so combined throughput
+  across the two capped containers should land at the same ceiling as the current single
+  4-worker/4-core container — or worse, once the load balancer's own latency/hop overhead is
+  added. True horizontal scaling requires genuinely additional hardware (a second machine, a free-
+  tier cloud VM); confirmed there's no way to fake that gain on a single 4-core box. Logged as a
+  reasoned-but-untested conclusion; left un-run by choice to move on to `rss_poller.py`.
+- PgBouncer and Redis (Phase 2) remain deprioritized per the 2026-09-12 reasoning above — no new
+  information changes either verdict.
+
+### rss_poller.py — containerized (2026-09-12)
+- Confirmed `main()` already had a `while True: poll_once(); sleep(300)` loop from earlier work —
+  the "run manually" status only meant `poll_once()` had been invoked directly, not that the
+  continuous-loop structure was missing.
+- `DB_DSN` switched to `os.environ.get("DATABASE_URL", "postgresql://...localhost...")`, same
+  env-var-with-fallback pattern as `main.py`.
+- **Decided no `asyncpg` pool needed here** (reasoned, not assumed): the poller is a single
+  sequential process with one connection and no concurrent requests, unlike `api`'s many
+  concurrent HTTP requests — pooling solves a concurrency problem this process doesn't have.
+- **Separate Dockerfile + requirements per service, not a shared one.** Reasoned that `api` and
+  `rss_poller` have different `CMD`s and dependency sets (poller doesn't need `fastapi`/
+  `gunicorn`/`uvicorn`), and a shared Dockerfile handling two images invites confusion for anyone
+  reading it later. Added `Dockerfile.poller` (same base image, installs `requirements-poller.txt`
+  — just `feedparser`+`psycopg2-binary`, no `EXPOSE`/ulimits since there's no HTTP concurrency) and
+  `requirements-poller.txt`.
+- Caught and fixed a copy/paste bug mid-session: `Dockerfile.poller` initially `COPY`'d `main.py`
+  instead of `rss_poller.py` while the `CMD` still ran `rss_poller.py` — fixed to copy the right
+  file.
+- Added `rss_poller` service to `docker-compose.yml`: built from `Dockerfile.poller` via
+  `build.context`/`dockerfile:` override, same `DATABASE_URL` as `api`, `depends_on: postgres:
+  condition: service_healthy`, `restart: unless-stopped` (reasoned: an unhandled exception from a
+  flaky feed fetch shouldn't leave the poller dead — restart is the appropriate policy here, same
+  as `api`).
+- **Verification caught a real gotcha, not just a happy-path check**: `docker logs rss_poller`
+  showed nothing despite the poller having clearly inserted rows (confirmed via `SELECT count(*)`
+  climbing). Diagnosed as Python's stdout switching from line-buffered to block-buffered when not
+  attached to a TTY (a container's stdout is piped, not a terminal) — the classic
+  "print() invisible in Docker logs" gotcha. Fixed via `python -u rss_poller.py` in `CMD`. After
+  the fix, `docker logs -f rss_poller` showed live per-publisher polling output
+  (`Polling BBC World.... -> 23 entries processed`, etc.) confirming the 5-minute loop actually
+  cycles, not just that one poll happened.
+- **End-to-end confirmed working**: separate container, own trimmed image, auto-restarts on
+  failure, independent 5-minute polling loop against all 4 real publishers, row count climbing
+  live in `docker logs -f`.
+- Known open issue, flagged this session, **now fixed** (see next section): `insert_article` had
+  no dedup/conflict handling on `url` — every `poll_once()` re-fetched the same feed entries and
+  re-inserted them as new rows each cycle.
+
+### rss_poller.py — duplicate-row fix (2026-09-12)
+- **Diagnosed root cause**: `insert_article` used a plain `INSERT`, so every 5-minute poll cycle
+  re-inserted every still-live feed entry as a brand-new row — no identity check on `url` at all.
+  Confirmed via `SELECT ... ROW_NUMBER() OVER (PARTITION BY url ORDER BY id)` that real duplicates
+  (e.g. `blinkenlights.de`, 6 copies) were already accumulating, while the synthetic seed data
+  (`example.com/article/N`) was all unique — the duplication was entirely from the poller re-fetch
+  pattern, not the seed.
+- **Chose DB-level enforcement over app-level check-then-insert**, reasoned explicitly: a
+  "`SELECT` to check, then `INSERT` if absent" from app code has a TOCTOU (time-of-check-to-time-
+  of-use) race — a gap between the check and the write where a duplicate could still land — plus
+  it costs two round trips per row. A `UNIQUE` constraint enforced atomically by Postgres closes
+  that gap and is a single round trip via `ON CONFLICT`.
+- Added `UNIQUE` on `article.url` in `init.sql` (schema-of-record for future fresh volumes).
+- **Live-table migration required a two-step fix, not a straight `ALTER TABLE`**: the constraint
+  add failed first try (`ERROR: could not create unique index ... Key (url)=(...) is duplicated`)
+  because 418 real duplicate rows already existed from the un-deduped polling. Used a `WITH
+  duplicate_rows AS (SELECT id, ROW_NUMBER() OVER (PARTITION BY url ORDER BY id) AS row_num FROM
+  article) DELETE FROM article WHERE id IN (SELECT id FROM duplicate_rows WHERE row_num > 1);` CTE
+  to remove all but the earliest (`ORDER BY id`) copy of each duplicated `url`, deleting 418 rows,
+  then re-ran `ALTER TABLE article ADD CONSTRAINT uq_url UNIQUE (url);` successfully.
+- Updated `insert_article`'s `INSERT` to `... ON CONFLICT (url) DO NOTHING` so a re-seen `url` on a
+  future poll cycle silently no-ops instead of throwing `UniqueViolation` and crashing the loop.
+- **Verified end-to-end**: rebuilt `rss_poller`, ran a full cycle, confirmed via `docker logs -f`
+  no crash and via `SELECT count(*)` that already-seen URLs stopped adding new rows — only genuinely
+  new feed entries increment the count now.
+
 ### Not started yet
 - Decide next move: push further on tuning (more workers / check Docker's own CPU allocation to
   the container) vs. treat current state as "proven Postgres+API alone has a real ceiling" and
   move to Phase 2 (Redis) — per the plan, this is exactly the trigger point for adding a cache.
-- PgBouncer: deprioritized (see 2026-09-12 reasoning above) unless local `asyncpg` `max_size` is
-  pushed near Postgres's real connection ceiling across all workers/replicas in the future.
-- Horizontal scaling (more replicas + load balancer): identified as the real next lever, but
-  requires additional hardware not available to test on this machine (host has only 4 physical
-  cores, already saturated). Revisit if/when more compute becomes available.
-- Candidate free experiment not yet tried: disabling or reducing Gunicorn's `--access-logfile`
-  writes under load, since the flamegraph showed this as a comparably-sized per-request cost to
-  the other remaining ones (see 2026-09-12 session above).
-- rss_poller.py is still run manually, one-shot — not yet running continuously in the background
-  or containerized.
+  (Current lean, per 2026-09-12 session above: accept the ceiling, Redis/PgBouncer stay
+  deprioritized.)
+- Horizontal scaling (more replicas + load balancer): identified as the real next lever, reasoned
+  through conceptually (see above) but deliberately left untested — requires additional hardware
+  (second machine or free-tier cloud VM) not available locally. Revisit if/when more compute
+  becomes available.
 
 ### Learning material saved to Obsidian (`Learning/Backend Engineering/Python/FastAPI/`)
 - `fastapi-phase1-learnings.html` — visual summary, created after the first load-test run (covers

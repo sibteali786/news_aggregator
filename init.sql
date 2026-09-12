@@ -13,7 +13,7 @@ CREATE TABLE publisher (
 CREATE TABLE article (
     id            BIGSERIAL PRIMARY KEY,
     title         TEXT NOT NULL,
-    url           TEXT NOT NULL,
+    url           TEXT NOT NULL UNIQUE,
     publisher_id  INTEGER NOT NULL REFERENCES publisher(id),
     category      TEXT NOT NULL,    -- e.g. 'tech', 'sports', 'politics'
     region        TEXT NOT NULL,

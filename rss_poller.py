@@ -3,9 +3,10 @@ import time
 import feedparser
 import psycopg2
 from datetime import datetime, timezone
+import os
 
-DB_DSN = (
-    "dbname=feed_engine user=feed_admin password=feed_pass host=localhost port=5432"
+DB_DSN = os.environ.get(
+    "DATABASE_URL", "postgresql://feed_admin:feed_pass@localhost:5432/feed_engine"
 )
 POLL_INTERVAL_SECONDS = (
     300  # 5 min, matches the, "high priority" tier from your design doc
@@ -24,6 +25,7 @@ def insert_article(conn, title, url, publisher_id, category, region, published_a
             """
         INSERT INTO article (title, url, publisher_id, category, region, published_at)
             VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (url) DO NOTHING
         """,
             (title, url, publisher_id, category, region, published_at),
         )

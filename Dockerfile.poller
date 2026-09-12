@@ -1,0 +1,10 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements-poller.txt .
+RUN pip install --no-cache-dir -r requirements-poller.txt
+
+COPY rss_poller.py .
+
+CMD ["python","-u", "rss_poller.py"]
