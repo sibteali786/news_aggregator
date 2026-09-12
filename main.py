@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 import asyncpg
 from datetime import datetime
 import os
+from fastapi.responses import JSONResponse
 
 DB_DSN = os.environ.get(
     "DATABASE_URL", "postgresql://feed_admin:feed_pass@localhost:5432/feed_engine"
@@ -13,7 +14,7 @@ DB_DSN = os.environ.get(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.pool = await asyncpg.create_pool(DB_DSN, min_size=5, max_size=20)
+    app.state.pool = await asyncpg.create_pool(DB_DSN, min_size=5, max_size=22)
     yield
     await app.state.pool.close()
 
