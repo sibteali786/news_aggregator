@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 import asyncpg
 from datetime import datetime
 import os
+from fastapi.responses import JSONResponse
 
 DB_DSN = os.environ.get(
     "DATABASE_URL", "postgresql://feed_admin:feed_pass@localhost:5432/feed_engine"
@@ -13,7 +14,7 @@ DB_DSN = os.environ.get(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.pool = await asyncpg.create_pool(DB_DSN, min_size=5, max_size=22)
+    app.state.pool = await asyncpg.create_pool(DB_DSN, min_size=5, max_size=20)
     yield
     await app.state.pool.close()
 
@@ -63,3 +64,19 @@ async def get_feed(
         rows = await conn.fetch(query, *args)
 
     return [dict(r) for r in rows]
+
+
+@app.get("/feed/full-scan")
+async def getFullScanFeed(limit: int = Query(1_000_000, le=10_000_000)):
+    query = """
+        SELECT a.id, a.title, a.url, p.name AS "publisherName", a.category, a.region, a.published_at AS "publishedAt" 
+        FROM article a JOIN
+        publisher p on p.id = a.publisher_id ORDER BY a.id DESC LIMIT $1
+    """
+    args = limit
+
+    async with app.state.pool.acquire() as conn:
+        rows = await conn.fetch(query, args)
+    return JSONResponse(
+        [dict(r) | {"publishedAt": r["publishedAt"].isoformat()} for r in rows]
+    )

@@ -329,21 +329,273 @@ preference stored in the assistant's memory system, not just for today.
 
 ### Next session: pick up here
 Phase 1 diagnosis is essentially complete — decide how to spend effort next:
-1. **Quick/free experiment left on the table**: disable or reduce Gunicorn's `--access-logfile`
-   writes under load and re-run k6, since it showed up as a comparably-sized per-request cost.
-   Cheap to test, low expectation of a large win given everything else is now similarly small.
-2. **Decide whether to accept current performance as this hardware's ceiling** (p99 ~1.34-1.4s,
-   down from 10.93s baseline — a ~7-8x improvement overall) and move on to other parts of the
-   system (rss_poller containerization, new features), vs. continuing to chase diminishing
-   code-level returns.
+1. ~~**Quick/free experiment left on the table**: disable or reduce Gunicorn's `--access-logfile`
+   writes under load and re-run k6~~ — **done**: confirmed (2026-09-12 session, "Phase 1 — closed
+   out") that Gunicorn's `CMD` never included `--access-logfile` in the first place, so this
+   experiment was already effectively satisfied, just not logged as such at the time.
+2. **2026-09-16 decision: accept current performance as this hardware's ceiling** (p99 ~1.34-1.4s,
+   down from 10.93s baseline — a ~7-8x improvement overall) and move to the next phase rather than
+   continuing to chase diminishing code-level returns. Re-confirmed Redis wouldn't be worth adding
+   *at current scale*: same reasoning as before (Postgres already serves hot rows from
+   `shared_buffers`/OS cache at ~2ms, so Redis would just be another in-memory hop with no I/O to
+   save) — conditional "add it if it demonstrably helps p99, otherwise skip" test comes back
+   negative on this dataset size. Revisit only if a genuine I/O-bound cost re-emerges (e.g. a much
+   larger dataset that no longer fits in `shared_buffers`).
 3. **Horizontal scaling** (more replicas + load balancer) is the identified real next lever for
    further throughput, but requires additional hardware beyond this 4-core host — not testable
-   locally. Revisit only if/when more compute becomes available (e.g. a cloud VM).
-4. Redis (Phase 2) remains deprioritized — Postgres already serves hot rows from memory at
-   comparable speed, confirmed by reasoning and by `EXPLAIN ANALYZE`. Revisit only if a genuine
-   I/O-bound cost re-emerges (e.g. a much larger dataset that no longer fits in `shared_buffers`).
-5. PgBouncer remains deprioritized — the connection contention observed was in the app's own local
+   locally. **Deferred to a separate cloud-focused session** (this session is moving on to the next
+   phase instead).
+   - **2026-09-16 decision: plan is Oracle Cloud Free Tier**, not AWS/Azure. Reasoned through the
+     free-tier options: AWS (`t2.micro`/`t3.micro`, 1 vCPU/1GB, 12-month) and Azure (`B1s`, 1
+     vCPU/1GB, 12-month) are both too small to be a trustworthy second node — 1 vCPU would bottleneck
+     immediately on its own and wouldn't isolate whether horizontal scaling itself helps. Oracle's
+     free tier is **permanently free** (not 12-month) and offers **Ampere A1 (ARM)** instances up to
+     4 vCPUs / 24GB RAM total, enough to split into 2 real nodes with meaningful cores each — the
+     only one of the three that makes the "does a second real machine raise the ceiling" test fair.
+     User is checking out Oracle Cloud signup/setup separately; not yet provisioned. **Pick up here
+     in the next cloud-focused session**: provision 2 Oracle A1 nodes, put a load balancer in front,
+     re-run `k6/load_test.js` against the pair, compare p99 against the single-host 1.34–1.4s
+     baseline.
+4. PgBouncer remains deprioritized — the connection contention observed was in the app's own local
    `asyncpg` pool, not Postgres's connection ceiling. Revisit only once local `max_size` is pushed
    near Postgres's real limit across all workers/replicas.
-6. rss_poller.py is still run manually, one-shot — not yet running continuously in the background
-   or containerized.
+
+### 2026-09-16 — decided: Phase 2 (Redis) needs a synthetic hot-key/high-volume load tier first
+- **Reasoning**: the plan's Phase 2 goal is a before/after Redis graph, per the system-design case
+  study (`Learning/System Design/Practice/News Aggregator/part1_news_aggregator.html`,
+  `part2_news_aggregator.html`) that assumes ~100M DAU with spikes to ~500M. Real traffic on this
+  project (4 RSS publishers polled every 5 min, uniform random-region k6 test) never gets close to
+  that, and won't organically — so adding Redis against current load would be speculative, not
+  proven, exactly what Phase 1's "don't add Redis speculatively, prove you need it first" warns
+  against.
+- **Resolution**: don't chase real user/data growth (there isn't any) — simulate the case study's
+  scale synthetically, the same way Phase 1's `seed.py`/`k6/load_test.js` already stood in for real
+  load. Concretely, before Phase 2 starts:
+  1. Bump seed volume well past the current 1M rows (e.g. 10M–50M) and/or skew region distribution
+     so a few regions dominate, instead of the current uniform spread across all regions.
+  2. Add a **hot-key k6 scenario** alongside the existing random-region one — most VUs hitting one
+     or two regions — since that's the access pattern a cache actually helps with; a uniform-random
+     test spreads load evenly and structurally can't show a caching win.
+  3. Re-run k6 against this new load tier on the current Postgres-only setup and confirm it actually
+     degrades on hot keys (re-creating Phase 1's "feel the pain" step, but for cache-shaped pain —
+     repeated hot reads — rather than the CPU-parallelism pain already solved).
+  4. Only once that degradation is shown does Phase 2 (add Redis, compare graphs) become a real
+     "prove it helps" exercise instead of cargo-culting the plan.
+- Same logic will apply later to justifying Phase 3 (Kafka/outbox): that needs a simulated **write
+  burst** (e.g. a burst-producer script hammering inserts, mimicking a breaking-news spike), not
+  organic traffic, to justify decoupling ingestion from cache-serving.
+- **Step 1 done (2026-09-16/17): `seed.py` chunked and 50M rows seeded.**
+  - Diagnosed the original `seed.py`: built the entire CSV for `count` rows into one `io.StringIO`
+    buffer before a single `copy_expert` call — for 50M rows this filled available RAM (10.7GB
+    free of 16GB total) during a live run, confirming the concern before touching the code.
+  - Fix (user-written, via `islice`-based batching, arrived at through Socratic back-and-forth):
+    added `batch_generator(rows, batch_size)` — `while batch := list(islice(rows, batch_size)):
+    yield batch` — and `main()` now loops over 1M-row batches, building/flushing/`copy_expert`-ing
+    one small buffer per batch (`buf.seek(0); buf.truncate(0)` between batches) instead of one
+    50M-row buffer.
+  - **Key insight surfaced during design**: because `generate_rows(count, publisher_ids)` is called
+    *once* and `islice` just carves pieces off that same shared generator, the `i` used for
+    `Synthetic Article {i}` / `https://example.com/article/{i}` keeps counting globally across all
+    batches (0 → 49,999,999) — sidesteps the per-batch-offset problem that coming at this via
+    "call `generate_rows(batch_size,...)` fresh per batch" would have hit (duplicate URLs into the
+    `UNIQUE (url)` constraint, since `i` would reset to 0 each call). Also naturally handles a
+    non-evenly-divisible remainder batch for free (the final `islice` just returns whatever's left,
+    however small, and the `while` loop stops on an empty list) — no manual `math.ceil`/`min`
+    capping needed once `islice` is shared across one generator instance.
+  - **Verified**: `SELECT count(*) FROM article;` confirms 50,000,000 rows; RAM stayed within
+    available limits throughout the run (watched via `htop`/`free -h`), no swelling/OOM like the
+    pre-chunking attempt.
+- **Next**: hot-key k6 scenario (skew requests toward 1-2 regions instead of uniform-random) against
+  this 50M-row table, to see whether Postgres alone actually degrades at this volume+access-pattern
+  before touching Redis.
+
+### 2026-09-17 — uniform-random re-test at 50M rows, then hot-key k6 scenario, then verdict on Redis
+- **Uniform-random re-test at 50M rows** (same `k6/load_test.js` as the original 1M-row runs, no
+  code changes): p99 **1.67-1.68s**, vs. the ~1.34-1.4s baseline at 1M rows — a real but modest
+  increase. `EXPLAIN ANALYZE` on `region='US'` at 50M rows: still an **Index Scan Backward** on
+  `article_pkey`, **Execution Time 0.086ms** — confirmed the query itself did not get more
+  expensive with 50x the data (consistent with cursor-pagination-on-indexed-PK not degrading with
+  table size, same conclusion as the original Phase 1 diagnosis). Correctly reasoned the p99 bump
+  is consistent with the already-known CPU-bound framework-overhead ceiling (this `main.py` is the
+  `Query()`-injected/`response_model=list[FeedItem]` version, not the raw-`Request` experiment from
+  the earlier session — so `solve_dependencies` + Pydantic validation are both live costs again),
+  not a DB-scaling problem.
+- **Hot-key k6 scenario added** (user-written, via Socratic back-and-forth): weighted-random region
+  selection using a cumulative-probability walk (`US: 0.7, EU: 0.2, APAC: 0.07, LATAM: 0.03`) —
+  iterate `[{region, value}, ...]` with `for...of`, accumulate a running total, pick the first
+  region whose cumulative weight exceeds a single `Math.random()` draw. Caught and fixed two real
+  bugs along the way: `Math.floor(Math.random())` (always 0, `Math.floor` of anything in `[0,1)` is
+  0) → fixed to bare `Math.random()`; and `for...in` over the `REGIONS` array giving string indices
+  (`"0","1",...`) instead of the actual `{region, value}` objects → fixed to `for...of`.
+- **Verified the weighting actually worked**, not just assumed: added a k6 `Counter("region_counter")`
+  tagged per region (`.add(1, { region: region.region })`), plus one per-region threshold entry
+  (`'region_counter{region:US}': ['count>=0']`, etc.) — a deliberately unfailable threshold whose
+  only purpose is forcing k6's text summary to print each tagged submetric's line (k6's default
+  summary doesn't auto-break-down custom metrics by tag otherwise; learned via the "thresholds on
+  submetrics" doc). **Result matched the intended 70/20/7/3 weights almost exactly**: US 95768/136883
+  = 69.98%, EU 27542/136883 = 20.12%, APAC 9539/136883 = 6.97%, LATAM 4034/136883 = 2.95%.
+- **Hot-key run result**: p99 **1.83s** — a small bump from the uniform-random 50M-row run
+  (1.67-1.68s), nowhere near the dramatic "Postgres falls over under hot-key load" result the
+  system-design case study's ~100M DAU premise assumes.
+- **Root-cause reasoning for why hot-keying didn't matter (Socratic, arrived at by the user with one
+  assist)**: two contributing factors, then the fundamental one.
+  1. Postgres's buffer pool / OS page cache already keeps the hot working set in memory — every
+     query is `ORDER BY id DESC LIMIT 20`, so it only ever touches the same narrow "newest ~20 rows
+     per region" slice regardless of how many times or how heavily that region is hit. Skewing
+     access doesn't enlarge that slice.
+  2. **The fundamental reason**: the identified bottleneck (Phase 1, `py-spy`/`docker stats`) is
+     **CPU saturation from fixed per-request framework overhead** (`solve_dependencies`, Pydantic
+     validation, JSON serialization), not the DB layer. That cost is a function of *how many
+     requests/sec arrive*, not *which data or how repeated the data is* — so shifting the traffic
+     distribution across regions leaves total request volume and per-request CPU cost unchanged,
+     and the same 4 cores stay equally saturated either way. The earlier multi-worker/multi-core fix
+     (Phase 1) *raised* the CPU ceiling (10.93s → ~1.4s) but didn't remove the CPU-bound nature of
+     the bottleneck — `docker stats`/`top` still showed 0% idle across all 4 cores under load.
+- **General principle surfaced**: a cache only pays off when (a) the underlying fetch/compute is
+  genuinely expensive, and (b) many requests overlap on the same data so the cache is actually
+  reused. Here, condition (a) is false — the query is a sub-millisecond indexed lookup, already
+  effectively cached by Postgres itself — so no amount of access-pattern skew can make caching it
+  worthwhile. Repeating a cheap operation stays cheap.
+- **Verdict: the hot-key experiment succeeded, not failed** — it correctly demonstrated that Redis
+  would not help `/feed` as currently built, no matter the traffic skew, closing the loop opened by
+  the "does Redis help without more data/users" question from the 2026-09-16 session. Redis stays
+  deprioritized. It would only become relevant if the actual bottleneck shape changed — e.g. a
+  genuinely expensive per-request computation (complex ranking/aggregation, a slow downstream call),
+  or a dataset large enough to no longer fit in `shared_buffers`/OS cache (real disk I/O on "hot"
+  reads) — neither of which is true of this endpoint today.
+- **Superseded by the 2026-09-17 `/feed/full-scan` experiment below** — the "skip Redis vs. simulate
+  expensive cost" fork was resolved by actually building the expensive-cost simulation, which finally
+  produced a genuine justification for Redis rooted in a real failure, not just reasoning.
+
+### 2026-09-17 — shared_buffers/memory-limit experiment, then the genuinely expensive `/feed/full-scan` endpoint
+- **Attempted shrinking `shared_buffers` first, reasoned out of it before testing**: found
+  `shared_buffers` was already at Postgres's default (128MB) against a 12GB `article` table
+  (`pg_total_relation_size`) — already <1% of the table fits in Postgres's own buffer pool, yet
+  queries stayed sub-millisecond. Correctly concluded the **OS page cache** (not `shared_buffers`)
+  was serving hot reads, since the host has ~10.7GB free RAM independent of Postgres's internal
+  setting — so shrinking `shared_buffers` alone wouldn't force real disk I/O. Pivoted to constraining
+  the **container's total memory** instead (`deploy.resources.limits.memory: 512M` on the `postgres`
+  service in `docker-compose.yml`) — verified actually enforced via `docker stats` (`324.7MiB /
+  512MiB` ceiling shown live, not silently ignored despite `deploy.resources` historically being a
+  Swarm-only setting).
+- **First attempt at forcing cache misses (deep-pagination k6 scenario) also didn't break anything**,
+  and correctly reasoned out why before concluding "the memory limit doesn't work": added a random
+  `cursor` (uniform across the full 50M-row ID range) to `k6/load_test_deep_pagination.js`, replacing
+  "always fetch the newest rows." Result: p99 **1.84s**, indistinguishable from the earlier hot-key
+  result (1.83s); memory only reached 324MB of the 512MB limit — never even filled up. **Root cause
+  traced by hand**: the query is `WHERE region=$1 AND id<$2 ORDER BY id DESC LIMIT 20` — since 1-in-4
+  rows match a given region, Postgres only needs to examine ~80 rows (4 × the 20-row limit) to satisfy
+  any single request, *regardless of where in the 50M-row range the cursor lands*. Randomizing the
+  cursor changes *which* ~80 rows get touched, not *how many* — so even a fully memory-constrained,
+  fully-randomized-cursor test can't produce real per-request cost when every query is `LIMIT`-bounded
+  and indexed. Confirmed via real Block I/O this time (2.59GB read, vs. near-zero in prior runs) —
+  genuine disk I/O did occur cumulatively across requests, but each individual request stayed too
+  cheap to matter, so latency didn't move.
+- **Correctly identified the fix**: to force genuine per-request DB cost, the query itself needs to be
+  unable to stop early — i.e., drop `LIMIT` (or raise it enormously) so a single request has to
+  fetch/sort/return a large result set, not just walk ~80 rows and stop.
+- **Added `/feed/full-scan?limit=`, a new dedicated endpoint** (not a change to the real `/feed`
+  contract, since real users would never want an unbounded feed) — `Query(1_000_000, le=10_000_000)`,
+  no `region` filter, raw `JSONResponse` instead of `response_model=list[FeedItem]` (deliberately
+  keeping Pydantic out of this specific measurement). Two real bugs caught and fixed before it worked:
+  1. **`SELECT *` across the `article`/`publisher` join** — both tables have a column named `id`;
+     Postgres expands `SELECT *` left-to-right, so `dict(r)` silently let the *publisher's* `id`
+     overwrite the *article's* `id` (dict construction keeps the last-seen key). Fixed by explicitly
+     aliasing columns, same pattern as the original `/feed` query, instead of `SELECT *`.
+  2. **`TypeError: Object of type datetime is not JSON serializable`** — bypassing
+     `response_model=list[FeedItem]` also bypassed Pydantic's automatic `datetime → ISO-8601` string
+     conversion (a gotcha already known from Phase 0, but only realized here because this is the first
+     endpoint that skips Pydantic on the response side entirely). Fixed with
+     `dict(r) | {"publishedAt": r["publishedAt"].isoformat()}` per row.
+- **Manual curl baseline, before any load testing**: single unconcurrent requests already showed a
+  real cost curve — `limit=100_000` → 21.3MB response, 0.91s; `limit=1_000_000` → 212.7MB response,
+  **9.7s**, for one request with zero concurrency. First time in this project a single request alone
+  (no load test needed) demonstrated meaningfully expensive behavior.
+- **k6 scenario for `/feed/full-scan`** (`k6/load_test_deep_pagination.js`, repurposed): reasoned
+  through why the existing `ramping-vus`-to-1000 shape and `p(99)<200` threshold made no sense for an
+  endpoint whose single-request baseline is already multi-second — switched to `constant-vus` (10
+  VUs, fixed, no ramp), 90s duration, threshold dropped entirely, and `limit` picked randomly per
+  iteration from `[100_000, 300_000, 600_000, 800_000, 1_000_000]`. Caught a real bug mid-build: a
+  leftover `cursor` variable (from the deep-pagination version) was being passed as `limit` in the
+  URL instead of the actual randomly-picked limit value — fixed to use the correct variable.
+- **Result: real failures, not just slow numbers.** At just 10 concurrent VUs: Gunicorn workers hit
+  `WORKER TIMEOUT` (default 30s) and were killed mid-request, which cascaded into Postgres logging
+  `could not send data to client: Connection reset by peer` / `connection to client lost` (the
+  killed worker's DB connection dropped mid-transfer). k6 itself hit request timeouts (60s) on several
+  `limit=800_000`/`1_000_000` iterations. **22.85% of checks failed outright** — the first real
+  failures (not just degraded latency) anywhere in this entire project's load testing.
+  `http_req_duration`: avg 23.78s, median 15.77s, max 60s (timeout ceiling). `feed_api` memory spiked
+  to **4.38GiB** at one point; `feed_postgres` stayed comfortably inside its 512MiB limit (264-307MB)
+  throughout.
+- **Root-cause reasoning (Socratic, user-driven)**: since Postgres never approached its memory
+  ceiling but the API container spiked to 4+GB, the failure is rooted in **`main.py`'s handling of
+  the result**, not Postgres itself — `conn.fetch()` fully materializes up to a million
+  `asyncpg.Record`s, each gets converted to a dict, each `publishedAt` gets `.isoformat()`-converted,
+  all assembled into one giant Python list, then `json.dumps`-encoded into a single ~213MB string —
+  all in-process, all before a single response byte is sent. This is a genuinely expensive
+  computation, finally satisfying condition (a) of the caching principle established during the
+  hot-key experiment.
+- **Correctly reasoned through what a cache would and wouldn't fix**: caching raw DB rows would only
+  save the DB round-trip (a small slice of total cost); caching the **already-fully-serialized JSON
+  blob** would skip the DB fetch *and* the expensive dict-building/isoformat/json.dumps work entirely
+  on a cache hit — correctly identified as the right thing to cache, not the raw rows. Also correctly
+  identified the remaining gap: the current k6 script picks `limit` **uniformly at random** per
+  iteration, so repeat requests for the *same* limit are rare — a cache would mostly miss under this
+  access pattern. Concluded that a **weighted/skewed distribution over `limit` values** (same
+  cumulative-probability technique already built for regions) is needed before Redis can actually
+  demonstrate a hit-rate win, mirroring a real "some reports are more popular than others" pattern.
+- **Verdict: this closes the loop opened on 2026-09-16.** Redis now has a real, self-demonstrated
+  justification — not the original `/feed` endpoint (still correctly deprioritized, per the hot-key
+  and volume experiments), but a new, deliberately-expensive endpoint (`/feed/full-scan`) that
+  genuinely breaks under concurrent load today, on this hardware, with real worker timeouts and a
+  4GB+ memory spike as evidence.
+- **Next session: pick up here.**
+  1. Weight `LIMITS` in `k6/load_test_deep_pagination.js` (e.g. `1_000_000` heavily favored, others
+     rare) so repeated identical requests are common enough for a cache to show a real hit-rate
+     effect — same cumulative-probability-walk pattern already built for `REGIONS`.
+  2. Re-run the weighted version against the *uncached* `/feed/full-scan` first, to get a clean
+     "before" baseline (expect similar worker-timeout/memory-spike behavior, now with a known skewed
+     access pattern).
+  3. Implement Phase 2 (Redis) scoped specifically to `/feed/full-scan`: cache the final serialized
+     JSON blob per `limit` value (not raw rows), most likely with a TTL. This is also the natural
+     place to demo the TTL/thundering-herd concept from the original plan (Phase 2's milestone).
+  4. Re-run the same weighted k6 scenario against the cached version and compare — this is the
+     legitimate "two load-test graphs, before/after Redis" the plan originally asked for, this time
+     backed by a real breaking point instead of an assumed one.
+
+### 2026-09-16/17 — `seed.py` rewritten for chunked `COPY` (islice-based batching)
+- **Motivation**: previous seeding path wasn't chunked — this session rebuilt `batch_generator` to
+  slice a row-generator into fixed-size batches and `COPY` one chunk at a time, needed for the
+  10M–50M-row bump identified above (Phase 2 prerequisite).
+- **Built via Socratic back-and-forth (user wrote every line by hand), landed on**:
+  `generate_rows(n, publisher_ids)` — unchanged generator (`yield`) producing one row tuple at a
+  time. `batch_generator(rows, batch_size)` — `while batch := list(islice(rows, batch_size)): yield
+  batch`, slicing the generator object directly (no `iter()` needed — a generator object is already
+  an iterator). `main()` loops `for tuples in batch_generator(...): for row in tuples:
+  writer.writerow(row)`, then one `buf.seek(0)` + `cur.copy_expert(...)` + `buf.seek(0)` +
+  `buf.truncate(0)` **per chunk**, not per row.
+- **Bugs caught and fixed along the way** (all by the user, self-diagnosed after Socratic
+  questioning, not given as code):
+  1. `iter(count)` called on an int (`count` was the row-count int, not the generator) — fixed by
+     passing the actual generator object returned from `generate_rows(...)`.
+  2. Outer loop variable (`for row in batch`) was actually a whole chunk (list of ~1M tuples), not
+     one row — fixed by adding the inner `for row in tuples` loop before `writer.writerow`.
+  3. `buf.seek(0)`/`truncate(0)` were initially placed inside the per-row loop, collapsing batching
+     back into one `COPY` per row — fixed by moving the seek/copy/truncate block to run once per
+     chunk, after all rows of that chunk are written.
+- **Dry run (`main(5)`) hit a real constraint, not a code bug**: `psycopg2.errors.UniqueViolation`
+  on `uq_url` — expected, since ~10M rows already exist in `article` from earlier seeding/polling
+  sessions and `article/0`, `article/1`, etc. collide. Confirmed the chunking/COPY mechanics
+  themselves worked (reached `copy_expert` and Postgres processed the batch before rejecting it).
+  **Resolution: truncate/delete `article` before a clean reseed** (chosen over unique-offset URLs or
+  a staging-table + `ON CONFLICT DO NOTHING` approach, since this is disposable synthetic seed data).
+- **Also learned**: `conn.commit()` only fires once, after the full chunk loop — so row count stays
+  visibly frozen in another `psql` session for the entire run, not because nothing is happening, but
+  because Postgres only shows committed data to other sessions (default READ COMMITTED isolation).
+- Ran the real seed (`main(50_000_000)`, default) after the above — **result not yet confirmed in
+  this log; check `SELECT count(*) FROM article;` next session** once it's had time to finish and
+  commit.
+- Visual summary saved to Obsidian:
+  `Learning/Backend Engineering/Python/FastAPI/8-chunked-seeding-islice.html` (covers
+  `itertools.islice`, generator-object-as-iterator, the walrus `while` batching loop, and
+  `StringIO.seek`/`.truncate` semantics).

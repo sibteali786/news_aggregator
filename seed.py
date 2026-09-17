@@ -3,6 +3,7 @@ import io
 import os
 import random
 from datetime import datetime, timedelta
+from itertools import islice
 
 import psycopg2
 
@@ -27,6 +28,11 @@ def generate_rows(n, publisher_ids):
         )
 
 
+def batch_generator(rows, batch_size):
+    while batch := list(islice(rows, batch_size)):
+        yield (batch)
+
+
 def main(count: int):
     conn = psycopg2.connect(DATABASE_URL)
     cur = conn.cursor()
@@ -38,17 +44,22 @@ def main(count: int):
 
     buf = io.StringIO()
     writer = csv.writer(buf)
-    for row in generate_rows(count, publisher_ids):
-        writer.writerow(row)
-    buf.seek(0)
-
-    cur.copy_expert(
-        """
-        COPY article (title, url, publisher_id, category, region, published_at)
-        FROM STDIN WITH (FORMAT csv)
-        """,
-        buf,
-    )
+    rows = generate_rows(count, publisher_ids)
+    batch = batch_generator(rows, 1_000_000)
+    for tuples in batch:
+        for row in tuples:
+            writer.writerow(row)
+        # seek to start to read from start of buffer
+        buf.seek(0)
+        cur.copy_expert(
+            """
+            COPY article (title, url, publisher_id, category, region, published_at)
+            FROM STDIN WITH (FORMAT csv)
+            """,
+            buf,
+        )
+        buf.seek(0)
+        buf.truncate(0)
     conn.commit()
     cur.close()
     conn.close()
@@ -58,4 +69,4 @@ def main(count: int):
 if __name__ == "__main__":
     import sys
 
-    main(int(sys.argv[1]) if len(sys.argv) > 1 else 1_000_000)
+    main(int(sys.argv[1]) if len(sys.argv) > 1 else 50_000_000)
