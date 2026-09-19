@@ -1,6 +1,17 @@
 version: "3.9"
 
 services:
+  redis: 
+    image: redis:7-alpine
+    container_name: feed_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
   postgres:
     image: postgres:17
     container_name: feed_postgres
@@ -33,10 +44,13 @@ services:
     restart: unless-stopped
     environment:
       DATABASE_URL: postgresql://feed_admin:feed_pass@postgres:5432/feed_engine
+      REDIS_URL: redis://redis:6379
     ports:
       - "8000:8000"
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
   rss_poller:
     build:

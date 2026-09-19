@@ -563,6 +563,39 @@ Phase 1 diagnosis is essentially complete — decide how to spend effort next:
      legitimate "two load-test graphs, before/after Redis" the plan originally asked for, this time
      backed by a real breaking point instead of an assumed one.
 
+### 2026-09-19 — weighted-limit k6 scenario built, "before" baseline captured, moving to Redis
+- **Weighted `LIMITS` added to `k6/load_test_deep_pagination.js`**, same cumulative-probability-walk
+  pattern as the region weighting: `100_000: 5%, 300_000: 5%, 600_000: 5%, 800_000: 70%, 1_000_000:
+  15%` — `800_000` deliberately made the "popular report" a cache should demonstrably help with.
+  Caught and fixed two real bugs before it worked, both via Socratic trace-by-hand (same method as
+  the original region-weighting bugs):
+  1. **Comparison backwards**: first attempt had `if (limit.p > runningTotal)` instead of
+     `if (runningTotal > random)` — traced by hand and found the random draw (`random`) was never
+     referenced in the condition at all, so `chosenLimitValue` stayed at its initial `0` for every
+     single iteration, regardless of the weights. Fixed to match the working region-weighting pattern.
+  2. **Threshold/tag mismatch**: threshold keys referenced `limit:100_000` (with underscores, matching
+     the *source code's* numeric-literal syntax) and included a non-existent `limit:200_000`, while
+     the actual tag values k6 stringifies are plain `100000` (underscores are just a JS numeric-literal
+     separator, stripped at parse time — not part of the runtime value). Fixed thresholds to
+     underscore-free values matching the real `LIMITS` array (`100000, 300000, 600000, 800000,
+     1000000`).
+  3. Also added a `Counter("limit_counter")` tagged per limit, mirroring the region counter — verified
+     the weighting roughly held even over a small sample (31 total iterations, since each request
+     takes many seconds): `800000` got 23/31 (~74%, close to the intended 70%), `1000000` got 3/31,
+     `300000` got 3/31, `100000` got 2/31, `600000` got 0/31 (plausible at only 5% weight over 31
+     draws).
+- **"Before" baseline result (uncached `/feed/full-scan`, weighted limits, 10 VUs, 90s)**: **worse**
+  than the earlier uniform-random run on every axis — **38.70% checks failed** (up from 22.85%),
+  `http_req_duration` avg **30.27s**, median 28.1s, max 60s (k6's timeout ceiling). New, more severe
+  failure mode observed this run: `Worker (pid:7) was sent SIGKILL! Perhaps out of memory?` — an
+  actual kernel OOM-kill, one step worse than the previous run's Gunicorn-initiated `WORKER TIMEOUT`.
+  Same Postgres-side cascade as before (`could not send/receive data from client: Connection reset by
+  peer` → `connection to client lost`, triggered by the killed worker's connection dropping mid-transfer).
+- **This is the "before" half of the before/after Redis comparison.** Next: design and implement the
+  Redis caching layer for `/feed/full-scan`, scoped exactly as reasoned on 2026-09-17 — cache the
+  final serialized JSON blob per `limit` value (not raw rows), then re-run this exact same weighted
+  k6 scenario against the cached version and compare against today's numbers.
+
 ### 2026-09-16/17 — `seed.py` rewritten for chunked `COPY` (islice-based batching)
 - **Motivation**: previous seeding path wasn't chunked — this session rebuilt `batch_generator` to
   slice a row-generator into fixed-size batches and `COPY` one chunk at a time, needed for the
