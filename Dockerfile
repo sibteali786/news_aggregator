@@ -6,6 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
+COPY scripts/ ./scripts/ 
 
 RUN mkdir -p /var/log/gunicorn && chown -R www-data:www-data /var/log/gunicorn
 

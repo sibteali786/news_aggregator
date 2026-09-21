@@ -596,6 +596,185 @@ Phase 1 diagnosis is essentially complete — decide how to spend effort next:
   final serialized JSON blob per `limit` value (not raw rows), then re-run this exact same weighted
   k6 scenario against the cached version and compare against today's numbers.
 
+### 2026-09-19 (cont'd) — Redis implemented, but the "after" run was *worse*: a real thundering-herd/stampede finding
+- **Infra added, piece by piece, each with a real bug caught before it worked**:
+  - `docker-compose.yml`: new `redis` service (`redis:7-alpine`, no persistence volume — deliberate,
+    so every test run starts from a clean/empty cache — and no memory cap yet, deferred until after
+    a first working baseline). `api` service got `REDIS_URL: redis://redis:6379` and `depends_on:
+    redis: condition: service_healthy`. Two bugs caught: `redis=7.4.1` in `requirements.txt` (single
+    `=`, invalid pip syntax — fixed to `==`), and `depends_on: redis: condition: service_healthy`
+    referencing a service with no `healthcheck:` block at all (Compose has nothing to evaluate for
+    `service_healthy` without one) — fixed by adding a `healthcheck: test: ["CMD", "redis-cli",
+    "ping"]` to the `redis` service, mirroring the existing Postgres healthcheck pattern.
+  - `main.py`: `redis.asyncio` client wired into the existing `lifespan` pattern — `ConnectionPool
+    .from_url(REDIS_DSN)` → `Redis.from_pool(pool)` on `app.state.pool_redis`, closed via `.aclose()`
+    alongside the Postgres pool. One real bug caught via Socratic trace: first attempt called
+    `redis.get(key)` / `redis.set(...)` **without `await`** on the async client — since a bare,
+    un-awaited coroutine object is never equal to `None`, `if redis.get(key) != None` was *always*
+    true, meaning the code took the "cache hit" branch on literally every request regardless of
+    whether anything was ever cached. Fixed by adding `await` to both calls.
+  - **Cache design landed on** (via one-question-at-a-time Socratic walkthrough, each step reasoned
+    through rather than handed over): key = `fullscan:limit:{limit}` (namespaced by route + the one
+    relevant param, since `/feed/full-scan` ignores region); value = the **already-fully-serialized
+    JSON string** (`json.dumps(rows_modified)`), not raw rows — correctly reasoned that caching raw
+    rows would only save the DB round-trip, while caching the finished blob also skips the expensive
+    dict-building/isoformat/json.dumps work on a hit; cache hit returns via a plain `Response(content=
+    cached_str, media_type="application/json")` rather than `JSONResponse(...)`, specifically to avoid
+    double-serializing an already-serialized string; TTL `ex=20` chosen empirically-first (explicit
+    "test it, adjust after" decision) after reasoning through the tradeoff between "long enough to
+    reuse across a 90s test" and "short enough to actually observe an expiry event mid-test."
+- **Manual curl verification (clean, no concurrency) — worked exactly as designed**: first request
+  (cache miss) 1.045s / 22.7MB; identical second request (cache hit) **0.089s** / same 22.7MB — a
+  **~12x** speedup, same payload, confirming the cached-blob mechanism itself is correct in isolation.
+- **Re-ran the exact same weighted k6 scenario (10 VUs, 90s) against the now-cached endpoint —
+  result was *worse* than the uncached "before" baseline, not better**: 66.66% checks failed (up
+  from 38.70%), `http_req_duration` avg 41.8s / median 47.23s (up from avg 30.27s / median 28.1s),
+  another kernel `SIGKILL` OOM. Weighting still held roughly as intended (`800000`: 16/26,
+  `1000000`: 6/26).
+- **Root-cause diagnosis (Socratic, user needed a direct explanation after initial guesses)**: this
+  is a **cache stampede / thundering herd**, and a severe one, because request completion time under
+  load (avg 41.8s) vastly exceeds the TTL (20s). With 10 concurrent VUs and no request-coalescing/
+  locking around the cache-miss path, multiple VUs can check Redis for the same hot key (`800000`,
+  70% weight) at effectively the same moment, all see "not cached yet," and all independently trigger
+  the full expensive path (Postgres fetch → materialize hundreds of thousands of rows → build a
+  ~200MB JSON string) *simultaneously* — then each of those duplicate computations **also** writes
+  its own redundant ~200MB copy into Redis. Net effect: strictly *more* total memory pressure than
+  the uncached baseline (N duplicate in-process blobs *plus* N duplicate Redis-side copies, vs. just
+  N duplicate in-process blobs before), which explains both the higher failure rate and the more
+  frequent/earlier OOM. This is exactly the "TTL + thundering herd" concept the original plan called
+  out as a Phase 2 milestone — reproduced for real, in a more severe form than a textbook example
+  because of the TTL-vs-completion-time mismatch identified above.
+- **Correctly self-diagnosed partial explanation before assistance**: recognized that *sequential*
+  timing (one request finishes, populates cache, later requests within the TTL window benefit) was
+  sound reasoning — the gap was not realizing that *concurrent* arrivals during the population window
+  bypass that entirely, since nothing coordinates simultaneous misses on the same key.
+- **Not yet implemented — identified as the fix, deferred to next step**: stampede protection /
+  request coalescing (e.g. a Redis `SET key value NX` used as a lock, so one request "claims" the job
+  of populating the cache while concurrent others wait or fall back, instead of every miss
+  independently redoing the full expensive work).
+- **Next: re-run at lower concurrency (2 VUs instead of 10)** first, to see whether the cache
+  delivers a clean win *without* the stampede confounding the result — isolating "does caching help
+  the popular key" from "does caching survive concurrent cold-start misses," before circling back to
+  implement stampede protection as its own deliberate experiment.
+- **Low-concurrency (2 VUs, 90s) re-run: clean, unambiguous win — the first "before/after Redis"
+  result this project set out to produce.** `checks_failed` **0.00%** (down from 38.70% uncached-at-
+  10-VUs and 66.66% cached-at-10-VUs-with-stampede). `http_req_duration` avg **2.87s**, median
+  **913.53ms** (down from avg 30.27s / median 28.1s uncached). Memory stayed contained throughout:
+  `feed_api` never exceeded ~1GB (down from the 4.38GB spikes and OOM kills at 10 VUs),
+  `feed_postgres` never exceeded ~200MB. Weighting held (`800000`: 41/63 ≈ 65%, close to the intended
+  70%; `1000000`: 9/63; `300000`/`600000`: 5/63 each; `100000`: 3/63). `max=14.06s`/`p(90)=10.13s`
+  still show some slow tail requests (plausibly the rarer `1_000_000` key's first-ever miss before
+  anything is cached), but nothing close to the previous timeout/OOM territory.
+- **Diagnosis confirmed empirically**: at low enough concurrency, the odds of multiple VUs colliding
+  on the same *uncached* key at the same instant drop sharply, so the cache gets a real chance to
+  populate once and then serve fast repeated hits — exactly the mechanism the design intended,
+  without the stampede pathology from the 10-VU run masking it.
+- **Verdict**: Redis now has a real, self-demonstrated "before/after" result — but scoped honestly:
+  it works cleanly at low concurrency (2 VUs) and actively makes things worse at higher concurrency
+  (10 VUs) without stampede protection. Both results are legitimate and worth keeping — this is a
+  more honest, more production-realistic finding than a clean win at every concurrency level would
+  have been (a cache is not automatically a good idea; it depends on whether cold-start/expiry
+  windows are protected against concurrent duplicate work).
+- **Next session: pick up here.**
+  1. Implement stampede protection (e.g. a Redis `SET key value NX` lock around the cache-miss path,
+     so only one concurrent request per key does the expensive work while others wait/fall back)
+     specifically to make the 10-VU case behave like the 2-VU case.
+  2. Re-run the 10-VU weighted scenario again after that fix and compare all three data points
+     (10 VUs uncached, 10 VUs cached-no-protection, 10 VUs cached-with-protection) — this is the
+     complete, honest version of the plan's "before/after Redis" milestone.
+  3. Only after that: decide whether to add a memory cap to the `redis` service (deferred from
+     2026-09-19's infra setup) now that real usage patterns/sizes are known from these runs.
+
+### 2026-09-20/21 — stampede protection implemented (Redis lock + safe compare-and-delete release)
+- **Dockerfile bug caught before the feature could even boot**: `Dockerfile` only had `COPY main.py .`
+  — the new `scripts/` directory (holding the Lua release script) never made it into the image, so
+  the container failed at import time with `ModuleNotFoundError: No module named 'scripts'`, crashing
+  every Gunicorn worker on boot (`HaltServer 'Worker failed to boot.'`). Fixed by adding
+  `COPY scripts/ ./scripts/`. Confirmed no `__init__.py` needed — Python 3.3+ implicit namespace
+  packages (PEP 420) handle a directory without one, since the fix was just making the directory
+  present in the image at all.
+- **Design walked through one question at a time (Redis's own "Distributed locks with Redis" docs
+  read directly, then applied)**, landing on:
+  - **Separate lock key** (`fullscan:lock:limit:{limit}`) distinct from the data key
+    (`fullscan:limit:{limit}`) — reasoned explicitly that conflating the two would let a lock
+    placeholder be misread as real cached data by an unrelated `GET`.
+  - **`SET lock_key token NX EX <ttl>`** as the acquire mechanism — `NX` as the mutex (only one
+    concurrent `SET` can succeed), a per-request random `token` (`str(uuid.uuid4())`, correctly
+    reasoned as sufficient — not cryptographic security, just "unique enough," matching the Redis
+    doc's own framing) stored as a local variable scoped to that request's coroutine (no shared
+    state needed, since each HTTP request is its own independent invocation).
+  - **Safe compare-and-delete release via Lua script** (`scripts/deleteKey.py`,
+    `if redis.call("get",KEYS[1]) == ARGV[1] then return redis.call("del",KEYS[1]) else return 0
+    end`), executed atomically through `redis_client.register_script(...)` (registered once in
+    `lifespan`, called per-release) — **not** a plain blind `DELETE`. Reasoned through the exact
+    failure mode this avoids: if a slow winner's lock outlives its own `EX` and a second request
+    acquires a fresh lock in the gap, the original (slow) winner finally finishing and blindly
+    deleting would delete the *second* request's legitimate lock, letting a third request pile on —
+    a cascading correctness bug a single unconditional `DELETE` doesn't protect against. Note:
+    Redis's newer `DELEX key IFEQ` (built-in equivalent, Redis 8.4+) isn't available on `redis:7-
+    alpine`, confirmed via version check before committing to the Lua-script route.
+  - **Losers poll the *data* key** (not the lock key) at a fixed 500ms interval, up to N retries,
+    then fall back to computing themselves unprotected if the budget is exhausted — deliberately
+    chosen over Pub/Sub or `BLPOP`-based notification (both discussed and explicitly deferred as a
+    "production-grade upgrade" to revisit later, not implemented this round) since the goal was
+    demonstrating the coalescing *concept* clearly, not building a fully production-grade version
+    first. **User asked to be reminded to circle back to Pub/Sub and `BLPOP` as the more advanced,
+    non-polling approaches — still outstanding.**
+- **Two real `await`-missing bugs caught via the same trace-by-hand method as prior sessions**: first
+  `fetchFromDb(...)` (an `async def` helper) called without `await` at both call sites, and
+  `app.state.lockDelSript(keys=[...], args=[...])` (the registered Lua script call, also async on an
+  async Redis client) called without `await` — both silently returned unresolved coroutine/Script-call
+  objects instead of real values until fixed. Consistent recurring bug class across this whole session
+  (same root cause as the original `redis.get`/`redis.set` await bugs from 2026-09-19).
+- **Lock TTL vs. wait-budget tuning went through two iterations, each empirically tested rather than
+  guessed once and trusted:**
+  - **Iteration 1**: `EX=18` (just under the 20s data TTL, chosen as a crash-safety margin) / wait
+    budget `range(20)` × 500ms = 10s max. **Result**: real improvement over the unprotected stampede
+    but still degraded — two consecutive 10-VU runs showed 11.36% then 0% failed, avg 21.98s then
+    11.38s. **Root cause correctly self-diagnosed by the user** (one assist needed): request
+    completion time under 10-VU contention (up to ~42s observed) regularly *exceeds* the 18s lock
+    TTL, so the lock can expire mid-computation, letting a second request acquire a fresh lock and
+    start a smaller-scale duplicate stampede while the original winner is still legitimately working
+    — not crashed, just slow. Also correctly identified the second half of the same problem
+    unprompted: even if the lock TTL were raised, a waiter that gives up after only 10s of polling
+    would *still* fall through and duplicate work against a winner that's merely slow, not dead — so
+    the wait-budget needed to scale together with the TTL, not just the TTL alone.
+  - **Iteration 2**: `EX=45` (comfortable margin above the observed ~42s worst case) / wait budget
+    `range(80)` × 500ms = 40s max. **Result: 0% failed on both of two consecutive 10-VU runs**, avg
+    duration **~6.8s** (down from 21.98s / 41.8s / 30.27s across the prior uncached/stampede/under-
+    tuned-lock states), memory capped at **~1.8GB** (down from 3.35GB with the shorter TTL, and from
+    the original 4.38GB OOM-triggering spikes with no protection at all). Total completed iterations
+    nearly doubled (135–141 vs. 44–82 in the tighter-window runs) — substantially more useful work
+    completed in the same wall-clock window, not just fewer failures.
+- **Full before/after comparison table, 10 VUs, weighted limits, 90s runs**:
+  | Scenario | Failed | avg | median | peak `feed_api` mem |
+  |---|---|---|---|---|
+  | Uncached | 38.70% | 30.27s | 28.1s | 4.38GB (OOM) |
+  | Cached, no protection (stampede) | 66.66% | 41.8s | 47.23s | OOM |
+  | Cached, lock (18s TTL / 10s wait) | 0–11% | 12–22s | 10–14s | 3.35GB |
+  | Cached, lock (45s TTL / 40s wait) | **0.00%** | **~6.8s** | **~4.1s** | **~1.8GB** |
+  | (reference) 2 VUs, cached, lock | 0.00% | 2.87s | 0.91s | <1GB |
+- **Remaining gap to the 2-VU numbers correctly reasoned through as structural, not a bug**: at 10
+  VUs spread across 5 `limit` keys with `800000` dominant (88–100 of ~135–141 total requests per
+  run), only one request per *key* can be the active "winner" computing at a time even with a
+  correctly working lock — so real queuing on the hottest key is expected and legitimate, not a sign
+  the protection is incomplete.
+- **This closes out the stampede-protection experiment and the plan's Phase 2 milestone honestly**:
+  a complete, self-demonstrated three-way before/after story (uncached → cached-without-protection →
+  cached-with-protection), each transition backed by real measured numbers and a root-cause
+  explanation, not assumptions.
+- **Next session: pick up here.**
+  1. **Outstanding reminder (user-requested)**: revisit Pub/Sub and `BLPOP`-based waiter notification
+     as the more production-correct alternative to fixed-interval polling — deferred, not forgotten.
+  2. Decide whether to add a memory cap to the `redis` service now that real cache sizes/usage
+     patterns are known from these runs (still deferred from 2026-09-19).
+  3. Minor cleanup flagged earlier but not yet done: duplicated fetch/serialize/cache logic between
+     the lock-acquired and fallback-after-retries branches in `getFullScanFeed` could be extracted
+     into a shared helper (partially done via `fetchFromDb`, but the caching/response-building steps
+     around it are still duplicated).
+  4. Decide next phase per `live_feed_engine_plan.md`: Phase 3 (Kafka/outbox), which the user has
+     specifically said they want to own.
+
 ### 2026-09-16/17 — `seed.py` rewritten for chunked `COPY` (islice-based batching)
 - **Motivation**: previous seeding path wasn't chunked — this session rebuilt `batch_generator` to
   slice a row-generator into fixed-size batches and `COPY` one chunk at a time, needed for the
