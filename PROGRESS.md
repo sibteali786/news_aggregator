@@ -775,6 +775,66 @@ Phase 1 diagnosis is essentially complete — decide how to spend effort next:
   4. Decide next phase per `live_feed_engine_plan.md`: Phase 3 (Kafka/outbox), which the user has
      specifically said they want to own.
 
+### 2026-09-21 — outstanding lock-design upgrades, deferred to a dedicated future session
+Two separate, orthogonal upgrades to the stampede-protection lock were identified during design
+discussion but deliberately not implemented this round (simpler options chosen instead, to keep the
+first working version learnable/buildable in one session). Both remain real, well-understood next
+steps — not vague ideas, concrete designs already reasoned through:
+
+1. **Lock lease renewal (heartbeat), replacing the current fixed TTL.**
+   - **Problem it solves**: the current lock (`SET fullscan:lock:limit:{limit} token NX EX 45`) commits
+     to one fixed TTL *at acquisition time*, before the winner knows how long its own work will
+     actually take. Guess too short and the lock can expire mid-computation while the winner is still
+     alive and working (the exact bug diagnosed and fixed this session by raising `EX` from 18→45 and
+     the wait budget from 10s→40s to match observed worst-case completion times, ~42s). Guess too long
+     and a genuinely crashed winner's lock lingers unnecessarily, slowing recovery for everyone else.
+   - **The fix**: instead of one static `EX` set once, the winning request periodically "renews"
+     (extends) the lock's TTL at an interval shorter than the TTL itself, *while it's still actively
+     working* — e.g. extend by another N seconds every N/2 seconds — and simply stops renewing (letting
+     it expire naturally) once the work finishes or the process dies. The lock then lives almost exactly
+     as long as real work is happening, no more, no less — removing the need to guess a single worst-case
+     number up front.
+   - **Why deferred**: meaningfully more complex than a fixed TTL — needs a background task (or periodic
+     check interleaved with the main DB fetch) running alongside the actual computation, correctly
+     coordinated with the existing token-based compare-and-delete release so a renewal never resurrects
+     a lock a *different* winner has since taken over. Real crash risk (the main reason a TTL safety net
+     exists at all) is also low on this single local Docker Compose setup, which is why the simpler fixed-
+     TTL approach was judged acceptable for this first working version.
+   - **This is orthogonal to item 2 below** — it's about how long the lock lives, not about how waiters
+     find out when work is done. The two can be combined independently (see matrix in the 2026-09-21
+     "fixed TTL vs. heartbeat, and how it relates to Pub/Sub/BLPOP" discussion).
+
+2. **Pub/Sub or `BLPOP`-based waiter notification, replacing fixed-interval polling.**
+   - **Problem it solves**: the current "loser" path (`for i in range(80): await asyncio.sleep(0.5); ...`)
+     polls the data key every 500ms — simple, but wastes GET calls when nothing has changed yet, and
+     introduces up to 500ms of pure latency between the winner actually finishing and a waiter noticing.
+   - **The fix (two documented options)**:
+     - **Redis Pub/Sub**: the winner, once done, `PUBLISH`es on a channel (e.g.
+       `fullscan:done:limit:{limit}`); waiters `SUBSCRIBE` and block until notified instead of polling
+       at all. Real complexity to handle: the classic race where a `PUBLISH` fires *before* a late
+       subscriber has started listening (a subscriber that starts too late can miss the notification
+       entirely and needs a fallback), plus subscriber lifecycle/cleanup via `redis-py`'s async pub/sub
+       API.
+     - **`BLPOP`/`BRPOP`**: a lighter-weight alternative — winner pushes a value onto a list once done,
+       waiters block on `BLPOP` until something appears. Avoids the pub/sub "message published before
+       anyone's listening" race (list items persist until popped, unlike pub/sub messages), simpler to
+       reason about, still avoids polling.
+   - **Why deferred**: the goal this session was demonstrating the *coalescing concept* clearly with a
+     working, understandable implementation — polling is simple to trace and reason about by hand, which
+     matched the project's learning-mode goals better as a first pass. Pub/Sub/`BLPOP` are real
+     production-grade upgrades explicitly flagged by the user as "come back to this," not rejected as
+     wrong approaches.
+   - **User's own framing worth preserving verbatim for next session**: distinguished these as solving
+     "how do waiters find out" vs. lease renewal solving "how long does the lock live" — confirmed
+     orthogonal, not competing solutions, can be combined in any pairing.
+
+**Suggested order for the dedicated follow-up session**: implement heartbeat/lease renewal first (smaller,
+self-contained change to the existing lock-acquisition code path), verify it under the same 10-VU weighted
+k6 scenario (expect the lock to survive computations of any length without needing a hand-tuned worst-case
+`EX` guess), *then* tackle Pub/Sub or `BLPOP` as the waiter-side upgrade, since it's the larger structural
+change (new message-passing pathway, not just a modified `SET`/renew call) and benefits from being tested
+against an already-correct lock-lifetime implementation rather than debugging both changes at once.
+
 ### 2026-09-16/17 — `seed.py` rewritten for chunked `COPY` (islice-based batching)
 - **Motivation**: previous seeding path wasn't chunked — this session rebuilt `batch_generator` to
   slice a row-generator into fixed-size batches and `COPY` one chunk at a time, needed for the

@@ -12,6 +12,7 @@ import uuid
 import asyncio
 
 from scripts.deleteKey import deleteKeyLuaScript
+from scripts.renewLock import renewLockLuaScript
 
 REDIS_DSN = os.environ.get("REDIS_URL", "redis://redis:6379")
 DB_DSN = os.environ.get(
@@ -24,7 +25,9 @@ async def lifespan(app: FastAPI):
     app.state.pool = await asyncpg.create_pool(DB_DSN, min_size=5, max_size=20)
     pool = redis.ConnectionPool.from_url(REDIS_DSN)
     app.state.pool_redis = redis.Redis.from_pool(pool)
+    # registering lua scripts
     app.state.lockDelSript = app.state.pool_redis.register_script(deleteKeyLuaScript)
+    app.state.lockRenewScript = app.state.pool_redis.register_script(renewLockLuaScript)
     yield
     await app.state.pool.close()
     await app.state.pool_redis.aclose()
@@ -41,6 +44,27 @@ async def fetchFromDb(query: str, args: tuple[str] | str | int):
     ]
     json_serialized = json.dumps(rows_modified)
     return json_serialized
+
+
+async def release_lock(lock_key: str, token: str):
+    try:
+        await app.state.lockDelSript(keys=[lock_key], args=[token])
+    except Exception as e:
+        print(f"Error releasing lock {lock_key}: ", e)
+
+
+async def renew_loop(
+    event: asyncio.Event, key: str, token: str, ttl: int = 10, interval: int = 5
+):
+    while True:
+        try:
+            await asyncio.wait_for(event.wait(), timeout=interval)
+            break
+        except asyncio.TimeoutError:
+            try:
+                await app.state.lockRenewScript(keys=[key], args=[token, ttl])
+            except Exception as e:
+                print("Error in redis script for renewal: ", e)
 
 
 class FeedItem(BaseModel):
@@ -107,14 +131,33 @@ async def getFullScanFeed(limit: int = Query(1_000_000, le=10_000_000)):
         ## create token
         token = str(uuid.uuid4())
         ## create a lock and acquire it
-        lockAcquired = await redis_client.set(lock_key, token, nx=True, ex=45)
+        lockAcquired = await redis_client.set(lock_key, token, nx=True, ex=10)
         if lockAcquired:
+            event = asyncio.Event()
+
+            async def fetch_and_signal():
+                try:
+                    rows = await fetchFromDb(query, args)
+                    return rows
+                finally:
+                    event.set()
+
+            try:
+
+                async with asyncio.TaskGroup() as tg:
+                    fetch = tg.create_task(fetch_and_signal())
+                    renewal_loop = tg.create_task(renew_loop(event, lock_key, token))
+            except* Exception as eg:
+                await release_lock(lock_key, token)
+                print(f"Request failed for database: {eg.exceptions}")
+                raise
             ## DB fetch
-            json_serialized = await fetchFromDb(query, args)
+            json_serialized = fetch.result()
             await redis_client.set(key, json_serialized, ex=20)
             ## release the lock
-            await app.state.lockDelSript(keys=[lock_key], args=[token])
+            await release_lock(lock_key, token)
             return Response(content=json_serialized, media_type="application/json")
+
         else:
             for i in range(80):
                 await asyncio.sleep(0.5)  # 500ms wait
