@@ -36,13 +36,18 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="feed-engine-api", lifespan=lifespan)
 
 
-async def fetchFromDb(query: str, args: tuple[str] | str | int):
-    async with app.state.pool.acquire() as conn:
-        rows = await conn.fetch(query, args)
+def processArticleResponse(rows) -> str:
     rows_modified = [
         dict(r) | {"publishedAt": r["publishedAt"].isoformat()} for r in rows
     ]
     json_serialized = json.dumps(rows_modified)
+    return json_serialized
+
+
+async def fetchFromDb(query: str, args: tuple[str] | str | int):
+    async with app.state.pool.acquire() as conn:
+        rows = await conn.fetch(query, args)
+    json_serialized = await asyncio.to_thread(processArticleResponse, rows)
     return json_serialized
 
 
